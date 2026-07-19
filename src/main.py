@@ -25,6 +25,9 @@ class CompilationConfig:
     app_type: str = "web"
     web_port: int = 3301
     resume_from_queue: bool = False
+    retry_failed: bool = False
+    retry_node_ids: list[str] | None = None
+    model_api_mode: str | None = None
 
 
 def _get_repo_root() -> str:
@@ -94,6 +97,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reset the output directory before copying the requirement directory and recompiling.",
     )
+    retry_group = parser.add_mutually_exclusive_group()
+    retry_group.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry all failed nodes in the existing queue without clearing the workspace.",
+    )
+    retry_group.add_argument(
+        "--retry-node",
+        nargs="+",
+        metavar="NODE_ID",
+        help="Retry only the specified node ids in the existing queue.",
+    )
     parser.add_argument(
         "--app-type",
         choices=list_app_types(),
@@ -126,6 +141,11 @@ def parse_args() -> argparse.Namespace:
         "--octos-mcp",
         help="Delegate stage execution to an octos MCP server (octos mcp-serve) at this URL (e.g. http://127.0.0.1:4033/mcp). octos brings its own model/key, so no OpenAI API key is needed. Falls back to OCTOS_MCP_URL. Mutually exclusive with --delegate-to.",
     )
+    parser.add_argument(
+        "--model-api-mode",
+        choices=["responses", "chat_completions"],
+        help="OpenAI-compatible model API mode. Defaults to ARC_OPENAI_API_MODE or responses.",
+    )
     return parser.parse_args()
 
 
@@ -136,6 +156,9 @@ def prepare_config(args: argparse.Namespace) -> CompilationConfig:
         clear_all=args.clear_all,
         app_type=args.app_type,
         web_port=args.web_port,
+        retry_failed=args.retry_failed,
+        retry_node_ids=args.retry_node,
+        model_api_mode=args.model_api_mode,
     )
 
 
@@ -145,10 +168,19 @@ def prepare_compilation(
     clear_all: bool = False,
     app_type: str = "web",
     web_port: int = 3000,
+    retry_failed: bool = False,
+    retry_node_ids: list[str] | None = None,
+    model_api_mode: str | None = None,
 ) -> CompilationConfig:
     normalized_output_dir = os.path.abspath(output_dir) if output_dir else _build_default_output_dir()
     normalized_requirement_dir = _resolve_requirement_dir(requirement_path)
     normalized_app_type = normalize_app_type(app_type)
+    normalized_retry_node_ids = [
+        str(node_id).strip() for node_id in (retry_node_ids or []) if str(node_id).strip()
+    ]
+
+    if clear_all and (retry_failed or normalized_retry_node_ids):
+        raise ValueError("--clear-all cannot be combined with retry options.")
 
     web_port = int(web_port)
     if normalized_app_type == "web" and (web_port < 1 or web_port > 65535):
@@ -156,8 +188,16 @@ def prepare_compilation(
 
     if normalized_app_type == "web":
         set_web_port(web_port)
+    normalized_model_api_mode = str(model_api_mode or "").strip() or None
+    if normalized_model_api_mode:
+        os.environ["ARC_OPENAI_API_MODE"] = normalized_model_api_mode
     queue_path = os.path.join(normalized_output_dir, ".arc", "processing_queue.json")
     resume_from_queue = (not clear_all) and os.path.exists(queue_path)
+    retry_requested = bool(retry_failed or normalized_retry_node_ids)
+    if retry_requested and not resume_from_queue:
+        raise FileNotFoundError(
+            f"Retry requires an existing queue in the output workspace: {queue_path}"
+        )
 
     if not resume_from_queue:
         staged_requirement_dir = normalized_requirement_dir
@@ -182,6 +222,9 @@ def prepare_compilation(
         app_type=normalized_app_type,
         web_port=web_port,
         resume_from_queue=resume_from_queue,
+        retry_failed=bool(retry_failed),
+        retry_node_ids=normalized_retry_node_ids or None,
+        model_api_mode=normalized_model_api_mode,
     )
 
 
@@ -217,6 +260,9 @@ async def run_serve(args: argparse.Namespace) -> None:
             clear_all=bool(payload.get("clear_all", False)),
             app_type=payload.get("app_type", args.app_type),
             web_port=int(payload.get("web_port", args.web_port)),
+            retry_failed=bool(payload.get("retry_failed", False)),
+            retry_node_ids=payload.get("retry_node_ids"),
+            model_api_mode=payload.get("model_api_mode", args.model_api_mode),
         )
         log_path = init_debug_logger(config.output_dir, reset_existing=not config.resume_from_queue)
         log_cb = cli_log if reporter is None else reporter.make_log_cb(cli_log)
@@ -230,6 +276,8 @@ async def run_serve(args: argparse.Namespace) -> None:
         raw = await workflow_manager.start_compilation(
             clear_all=False,
             resume_from_queue=config.resume_from_queue,
+            retry_failed=config.retry_failed,
+            retry_node_ids=config.retry_node_ids,
         ) or {}
         return {
             "ok": bool(raw.get("ok")),
@@ -287,6 +335,9 @@ async def run() -> None:
         log_path=log_path,
         web_port=config.web_port,
         resume_from_queue=config.resume_from_queue,
+        retry_failed=config.retry_failed,
+        retry_node_ids=config.retry_node_ids,
+        model_api_mode=config.model_api_mode,
     )
     log_cb = cli_log
     if reporter is not None:
@@ -306,6 +357,8 @@ async def run() -> None:
         await workflow_manager.start_compilation(
             clear_all=False,
             resume_from_queue=config.resume_from_queue,
+            retry_failed=config.retry_failed,
+            retry_node_ids=config.retry_node_ids,
         )
     finally:
         stop_cli_spinner()
