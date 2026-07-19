@@ -66,7 +66,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run ARC agent workflow from the command line.")
     parser.add_argument(
         "requirement_path",
-        help="Requirement directory containing requirements.yaml and optional reference/ assets. Its contents will be copied into output-dir/requirements/ before compilation.",
+        nargs="?",
+        help="Requirement directory containing requirements.yaml and optional reference/ assets. Its contents will be copied into output-dir/requirements/ before compilation. Not needed with --serve.",
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run as a resident agent-chat worker: heartbeat, poll the inbox for task_request messages, compile each request, and reply with task_result. Requires --agent-chat-url / AGENT_CHAT_URL.",
     )
     parser.add_argument(
         "--output-dir",
@@ -105,18 +111,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def prepare_config(args: argparse.Namespace) -> CompilationConfig:
-    normalized_output_dir = os.path.abspath(args.output_dir) if args.output_dir else _build_default_output_dir()
-    normalized_requirement_dir = _resolve_requirement_dir(args.requirement_path)
-    normalized_app_type = normalize_app_type(args.app_type)
+    return prepare_compilation(
+        requirement_path=args.requirement_path,
+        output_dir=args.output_dir,
+        clear_all=args.clear_all,
+        app_type=args.app_type,
+        web_port=args.web_port,
+    )
 
-    web_port = int(args.web_port)
+
+def prepare_compilation(
+    requirement_path: str,
+    output_dir: str | None = None,
+    clear_all: bool = False,
+    app_type: str = "web",
+    web_port: int = 3000,
+) -> CompilationConfig:
+    normalized_output_dir = os.path.abspath(output_dir) if output_dir else _build_default_output_dir()
+    normalized_requirement_dir = _resolve_requirement_dir(requirement_path)
+    normalized_app_type = normalize_app_type(app_type)
+
+    web_port = int(web_port)
     if normalized_app_type == "web" and (web_port < 1 or web_port > 65535):
         raise ValueError(f"Web port must be between 1 and 65535, got: {web_port}")
 
     if normalized_app_type == "web":
         set_web_port(web_port)
     queue_path = os.path.join(normalized_output_dir, ".arc", "processing_queue.json")
-    resume_from_queue = (not args.clear_all) and os.path.exists(queue_path)
+    resume_from_queue = (not clear_all) and os.path.exists(queue_path)
 
     if not resume_from_queue:
         _reset_directory(normalized_output_dir)
@@ -132,15 +154,80 @@ def prepare_config(args: argparse.Namespace) -> CompilationConfig:
         output_dir=normalized_output_dir,
         requirement_dir=normalized_requirement_dir,
         requirement_path=normalized_requirement_path,
-        user_requested_clear_all=args.clear_all,
+        user_requested_clear_all=clear_all,
         app_type=normalized_app_type,
         web_port=web_port,
         resume_from_queue=resume_from_queue,
     )
 
 
+async def run_serve(args: argparse.Namespace) -> None:
+    from integrations.agent_chat_worker import AgentChatWorker
+
+    url = args.agent_chat_url or os.environ.get("AGENT_CHAT_URL")
+    if not url:
+        raise SystemExit("--serve requires --agent-chat-url or AGENT_CHAT_URL")
+    try:
+        reporter = build_reporter(
+            url=args.agent_chat_url,
+            group=args.agent_chat_group,
+            to=args.agent_chat_to,
+            run_label="serve",
+        )
+    except ValueError:
+        reporter = None  # no progress target configured; task replies still work
+
+    async def run_task(payload: dict) -> dict:
+        config = prepare_compilation(
+            requirement_path=payload["requirement_dir"],
+            output_dir=payload.get("output_dir"),
+            clear_all=bool(payload.get("clear_all", False)),
+            app_type=payload.get("app_type", args.app_type),
+            web_port=int(payload.get("web_port", args.web_port)),
+        )
+        log_path = init_debug_logger(config.output_dir, reset_existing=not config.resume_from_queue)
+        log_cb = cli_log if reporter is None else reporter.make_log_cb(cli_log)
+        workflow_manager = ARCWorkflowManager(
+            workspace_path=config.output_dir,
+            requirement_path=config.requirement_path,
+            app_type=config.app_type,
+            web_port=config.web_port,
+            log_cb=log_cb,
+        )
+        raw = await workflow_manager.start_compilation(
+            clear_all=False,
+            resume_from_queue=config.resume_from_queue,
+        ) or {}
+        return {
+            "ok": bool(raw.get("ok")),
+            "failed_nodes": raw.get("failed_nodes") or [],
+            "output_dir": config.output_dir,
+            "log_path": log_path,
+        }
+
+    worker = AgentChatWorker(
+        url,
+        agent_name=os.environ.get("AGENT_CHAT_AGENT_NAME", "arc-compiler"),
+        task_runner=run_task,
+        api_token=os.environ.get("AGENT_CHAT_TOKEN"),
+        agent_token=os.environ.get("AGENT_CHAT_AGENT_TOKEN"),
+    )
+    print(f"ARC agent-chat worker online as '{worker.agent_name}' -> {url} (Ctrl-C to stop)", flush=True)
+    try:
+        await worker.run_forever()
+    finally:
+        await worker.aclose()
+        if reporter is not None:
+            await reporter.aclose()
+
+
 async def run() -> None:
     args = parse_args()
+    if args.serve:
+        await run_serve(args)
+        return
+    if not args.requirement_path:
+        raise SystemExit("requirement_path is required unless --serve is used")
     config = prepare_config(args)
     reporter = build_reporter(
         url=args.agent_chat_url,
