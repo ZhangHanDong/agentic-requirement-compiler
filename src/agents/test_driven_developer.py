@@ -11,6 +11,7 @@ from agents.factory import build_stage_agent
 from agents.runners import ainvoke_stage_agent
 from context.context_pipeline import context_pipeline
 from context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
+from integrations.stage_delegation import get_stage_delegator
 from tools.runtime_tools import build_run_build_tool as build_system_run_build_tool
 from tools.traceability_tools import build_traceability_tools
 
@@ -177,6 +178,40 @@ class TestDrivenDeveloper:
         else:
             run_build = build_system_run_build_tool(app_handler=self.app_handler, node_id=node_id, log_cb=self.log_cb)
 
+        message = get_user_prompt(
+            node_id=node_id,
+            dynamic_context=context_text,
+            interface_contract=interface_contract,
+            test_files=self._current_test_files,
+            test_type=test_type,
+            node_tests=current_node_tests,
+            previous_failure_summary=previous_failure_summary,
+        )
+        delegator = get_stage_delegator()
+        if delegator is not None:
+            await self._log("Delegating TDD implementation to agent-chat implementer.", node_id=node_id)
+            reply = await delegator.invoke_stage(
+                stage=self.agent_name,
+                node_id=node_id,
+                phase="IMPLEMENT",
+                workspace_root=workspace_root,
+                system_prompt=get_system_prompt(),
+                message=message,
+                response_schema=None,
+            )
+            # Verification stays system-owned: the implementer's claim is only
+            # accepted if ARC's own test run passes.
+            verification = await run_tests(None, self._current_test_files or None)
+            summary = str(reply.get("summary") or "").strip() or "delegated implementation completed"
+            await self._log("Delegated TDD session completed.", node_id=node_id)
+            if self._last_run_tests_exit_code == 0:
+                return f"IMPLEMENTED: {summary}"
+            return (
+                "Delegated implementation did not pass system-run tests.\n"
+                f"Implementer summary: {summary}\n"
+                f"{verification}"
+            )
+
         traceability_tools = build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
         agent = build_stage_agent(
             name="test_driven_developer",
@@ -188,15 +223,6 @@ class TestDrivenDeveloper:
             skills=[f"/skills/{name}/" for name in skill_names if (skill_root / name / "SKILL.md").exists()],
             memory=[],
             tools=[run_tests, run_build, *traceability_tools],
-        )
-        message = get_user_prompt(
-            node_id=node_id,
-            dynamic_context=context_text,
-            interface_contract=interface_contract,
-            test_files=self._current_test_files,
-            test_type=test_type,
-            node_tests=current_node_tests,
-            previous_failure_summary=previous_failure_summary,
         )
         await self._log("Invoking deep-agent TDD implementation.", node_id=node_id)
         payload = await ainvoke_stage_agent(

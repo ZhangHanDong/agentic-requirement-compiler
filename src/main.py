@@ -11,6 +11,7 @@ from app_type_handler import list_app_types, normalize_app_type
 from core.utils import cli_log, init_debug_logger, print_cli_banner, print_cli_startup, set_web_port, stop_cli_spinner
 from core.workflow import ARCWorkflowManager
 from integrations.agent_chat import build_reporter
+from integrations.stage_delegation import build_stage_delegator, set_stage_delegator
 
 
 @dataclass(slots=True)
@@ -106,6 +107,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--agent-chat-to",
         help="agent-chat agent/human to DM progress to. Falls back to AGENT_CHAT_TO.",
+    )
+    parser.add_argument(
+        "--delegate-to",
+        help="Delegate stage execution (design/tests/implementation) to this agent-chat agent (e.g. a Claude Code or Codex agent) instead of calling an OpenAI-compatible API. Requires --agent-chat-url / AGENT_CHAT_URL. Falls back to ARC_DELEGATE_TO.",
     )
     return parser.parse_args()
 
@@ -212,10 +217,19 @@ async def run_serve(args: argparse.Namespace) -> None:
         api_token=os.environ.get("AGENT_CHAT_TOKEN"),
         agent_token=os.environ.get("AGENT_CHAT_AGENT_TOKEN"),
     )
+    # Delegation is safe alongside the worker: tasks run sequentially inside
+    # run_forever, so the delegator's preview polls never race a cursor-advancing
+    # full inbox read.
+    delegator = build_stage_delegator(url=args.agent_chat_url, implementer=args.delegate_to)
+    if delegator is not None:
+        set_stage_delegator(delegator)
     print(f"ARC agent-chat worker online as '{worker.agent_name}' -> {url} (Ctrl-C to stop)", flush=True)
     try:
         await worker.run_forever()
     finally:
+        if delegator is not None:
+            set_stage_delegator(None)
+            await delegator.aclose()
         await worker.aclose()
         if reporter is not None:
             await reporter.aclose()
@@ -250,6 +264,9 @@ async def run() -> None:
     if reporter is not None:
         await reporter.register()
         log_cb = reporter.make_log_cb(cli_log)
+    delegator = build_stage_delegator(url=args.agent_chat_url, implementer=args.delegate_to)
+    if delegator is not None:
+        set_stage_delegator(delegator)
     try:
         workflow_manager = ARCWorkflowManager(
             workspace_path=config.output_dir,
@@ -264,6 +281,9 @@ async def run() -> None:
         )
     finally:
         stop_cli_spinner()
+        if delegator is not None:
+            set_stage_delegator(None)
+            await delegator.aclose()
         if reporter is not None:
             await reporter.aclose()
 

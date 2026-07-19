@@ -12,6 +12,7 @@ from agents.factory import build_stage_agent
 from agents.runners import ainvoke_stage_agent
 from context.context_pipeline import context_pipeline
 from context.prompts.interface_designer import get_system_prompt, get_user_prompt
+from integrations.stage_delegation import get_stage_delegator
 from tools.traceability_tools import build_traceability_tools
 
 
@@ -71,37 +72,50 @@ class InterfaceDesigner:
         )
         context_text = "\n\n".join(part.strip() for part in (static_context, dynamic_context) if part.strip())
 
-        agent = build_stage_agent(
-            name="interface_designer",
-            model=self.model,
-            system_prompt=get_system_prompt(),
-            response_format=InterfaceDesignResponse,
-            workspace_root=workspace_root,
-            writable_roots=[workspace_root],
-            skills=[f"/skills/{name}/" for name in skill_names if (skill_root / name / "SKILL.md").exists()],
-            memory=[],
-            tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
-        )
         message = get_user_prompt(
             node_id=node_id,
             requirement_data=requirement_data,
             dynamic_context=context_text,
         )
-        await self._log("Invoking deep-agent interface design.", node_id=node_id)
-        payload = await ainvoke_stage_agent(
-            agent,
-            message=message,
-            context=AgentRuntimeContext(
+        delegator = get_stage_delegator()
+        if delegator is not None:
+            await self._log("Delegating interface design to agent-chat implementer.", node_id=node_id)
+            payload = await delegator.invoke_stage(
+                stage=self.agent_name,
                 node_id=node_id,
                 phase="DESIGN",
-                app_type=app_type,
                 workspace_root=workspace_root,
-                requirement_path=self.requirement_path,
-            ),
-            thread_id=f"{node_id}:DESIGN:InterfaceDesigner",
-            label=self.agent_name,
-            log_cb=self.log_cb,
-        )
+                system_prompt=get_system_prompt(),
+                message=message,
+                response_schema=InterfaceDesignResponse.model_json_schema(),
+            )
+        else:
+            agent = build_stage_agent(
+                name="interface_designer",
+                model=self.model,
+                system_prompt=get_system_prompt(),
+                response_format=InterfaceDesignResponse,
+                workspace_root=workspace_root,
+                writable_roots=[workspace_root],
+                skills=[f"/skills/{name}/" for name in skill_names if (skill_root / name / "SKILL.md").exists()],
+                memory=[],
+                tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
+            )
+            await self._log("Invoking deep-agent interface design.", node_id=node_id)
+            payload = await ainvoke_stage_agent(
+                agent,
+                message=message,
+                context=AgentRuntimeContext(
+                    node_id=node_id,
+                    phase="DESIGN",
+                    app_type=app_type,
+                    workspace_root=workspace_root,
+                    requirement_path=self.requirement_path,
+                ),
+                thread_id=f"{node_id}:DESIGN:InterfaceDesigner",
+                label=self.agent_name,
+                log_cb=self.log_cb,
+            )
         bundle = self._normalize_design_payload(payload)
         await self._log(
             f"Interface design returned {len(bundle.get('interfaces', []))} interface(s).",

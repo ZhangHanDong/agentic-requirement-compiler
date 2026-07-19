@@ -14,6 +14,7 @@ class RecordingServer:
         self.requests: list[dict] = []
         self.response_status = 200
         self.get_responses: dict[str, dict] = {}
+        self.post_responses: dict[str, dict] = {}
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -43,7 +44,9 @@ class RecordingServer:
                 except json.JSONDecodeError:
                     body = raw.decode("utf-8", errors="replace")
                 self._record(body)
-                self._respond(server.response_status, {"ok": server.response_status == 200})
+                path = self.path.split("?")[0]
+                payload = server.post_responses.get(path, {"ok": server.response_status == 200})
+                self._respond(server.response_status, payload)
 
             def do_GET(self) -> None:
                 self._record(None)
