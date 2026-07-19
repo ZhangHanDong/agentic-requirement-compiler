@@ -66,3 +66,14 @@ namespaces = true
 
 [tool.setuptools.package-data]
 templates = ["**/*", "**/.*"]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+  "pytest-asyncio",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"

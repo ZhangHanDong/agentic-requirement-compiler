@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from app_type_handler import list_app_types, normalize_app_type
 from core.utils import cli_log, init_debug_logger, print_cli_banner, print_cli_startup, set_web_port, stop_cli_spinner
 from core.workflow import ARCWorkflowManager
+from integrations.agent_chat import build_reporter
 
 
 @dataclass(slots=True)
@@ -88,6 +89,18 @@ def parse_args() -> argparse.Namespace:
         default=3000,
         help="Single backend port for web apps. Ignored by non-web app types.",
     )
+    parser.add_argument(
+        "--agent-chat-url",
+        help="agent-chat backend base URL (e.g. http://127.0.0.1:8090) to report compilation progress to. Falls back to AGENT_CHAT_URL.",
+    )
+    parser.add_argument(
+        "--agent-chat-group",
+        help="agent-chat group to post progress into. Falls back to AGENT_CHAT_GROUP.",
+    )
+    parser.add_argument(
+        "--agent-chat-to",
+        help="agent-chat agent/human to DM progress to. Falls back to AGENT_CHAT_TO.",
+    )
     return parser.parse_args()
 
 
@@ -127,7 +140,14 @@ def prepare_config(args: argparse.Namespace) -> CompilationConfig:
 
 
 async def run() -> None:
-    config = prepare_config(parse_args())
+    args = parse_args()
+    config = prepare_config(args)
+    reporter = build_reporter(
+        url=args.agent_chat_url,
+        group=args.agent_chat_group,
+        to=args.agent_chat_to,
+        run_label=os.path.basename(config.output_dir),
+    )
     print_cli_banner()
     log_path = init_debug_logger(config.output_dir, reset_existing=not config.resume_from_queue)
     print_cli_startup(
@@ -139,13 +159,17 @@ async def run() -> None:
         web_port=config.web_port,
         resume_from_queue=config.resume_from_queue,
     )
+    log_cb = cli_log
+    if reporter is not None:
+        await reporter.register()
+        log_cb = reporter.make_log_cb(cli_log)
     try:
         workflow_manager = ARCWorkflowManager(
             workspace_path=config.output_dir,
             requirement_path=config.requirement_path,
             app_type=config.app_type,
             web_port=config.web_port,
-            log_cb=cli_log,
+            log_cb=log_cb,
         )
         await workflow_manager.start_compilation(
             clear_all=False,
@@ -153,6 +177,8 @@ async def run() -> None:
         )
     finally:
         stop_cli_spinner()
+        if reporter is not None:
+            await reporter.aclose()
 
 
 def main() -> None:
