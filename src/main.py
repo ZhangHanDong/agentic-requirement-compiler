@@ -11,6 +11,7 @@ from app_type_handler import list_app_types, normalize_app_type
 from core.utils import cli_log, init_debug_logger, print_cli_banner, print_cli_startup, set_web_port, stop_cli_spinner
 from core.workflow import ARCWorkflowManager
 from integrations.agent_chat import build_reporter
+from integrations.octos_mcp import build_octos_delegator
 from integrations.stage_delegation import build_stage_delegator, set_stage_delegator
 
 
@@ -112,6 +113,10 @@ def parse_args() -> argparse.Namespace:
         "--delegate-to",
         help="Delegate stage execution (design/tests/implementation) to this agent-chat agent (e.g. a Claude Code or Codex agent) instead of calling an OpenAI-compatible API. Requires --agent-chat-url / AGENT_CHAT_URL. Falls back to ARC_DELEGATE_TO.",
     )
+    parser.add_argument(
+        "--octos-mcp",
+        help="Delegate stage execution to an octos MCP server (octos mcp-serve) at this URL (e.g. http://127.0.0.1:4033/mcp). octos brings its own model/key, so no OpenAI API key is needed. Falls back to OCTOS_MCP_URL. Mutually exclusive with --delegate-to.",
+    )
     return parser.parse_args()
 
 
@@ -164,6 +169,15 @@ def prepare_compilation(
         web_port=web_port,
         resume_from_queue=resume_from_queue,
     )
+
+
+def resolve_stage_delegator(args: argparse.Namespace):
+    """Pick the configured stage-delegation backend (agent-chat or octos), if any."""
+    octos = build_octos_delegator(url=args.octos_mcp)
+    agentchat = build_stage_delegator(url=args.agent_chat_url, implementer=args.delegate_to)
+    if octos is not None and agentchat is not None:
+        raise SystemExit("--octos-mcp and --delegate-to are mutually exclusive; pick one backend")
+    return octos or agentchat
 
 
 async def run_serve(args: argparse.Namespace) -> None:
@@ -220,7 +234,7 @@ async def run_serve(args: argparse.Namespace) -> None:
     # Delegation is safe alongside the worker: tasks run sequentially inside
     # run_forever, so the delegator's preview polls never race a cursor-advancing
     # full inbox read.
-    delegator = build_stage_delegator(url=args.agent_chat_url, implementer=args.delegate_to)
+    delegator = resolve_stage_delegator(args)
     if delegator is not None:
         set_stage_delegator(delegator)
     print(f"ARC agent-chat worker online as '{worker.agent_name}' -> {url} (Ctrl-C to stop)", flush=True)
@@ -264,7 +278,7 @@ async def run() -> None:
     if reporter is not None:
         await reporter.register()
         log_cb = reporter.make_log_cb(cli_log)
-    delegator = build_stage_delegator(url=args.agent_chat_url, implementer=args.delegate_to)
+    delegator = resolve_stage_delegator(args)
     if delegator is not None:
         set_stage_delegator(delegator)
     try:

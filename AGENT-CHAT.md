@@ -80,3 +80,40 @@ Guarantees:
 Limitations: screenshot visual analysis still uses `VISUAL_API_KEY` when the
 requirement references screenshots; the implementer agent must run on the same
 machine (shared filesystem) and have permission to edit the workspace.
+
+## 4. Stage delegation to octos (direct MCP, no agent-chat)
+
+Delegate the stage agents to [octos](https://github.com/.../octos) via its MCP
+server instead of going through agent-chat. octos runs its own agentic coding
+loop with its own model + key, so ARC needs no OpenAI-compatible key.
+
+Launch octos as an MCP server whose working directory is ARC's output dir:
+
+```bash
+OCTOS_MCP_SERVER_TOKEN=secret \
+  octos mcp-serve --transport http --bind 127.0.0.1:4033 --cwd <ARC-output-dir>
+```
+
+Then run ARC pointing at it:
+
+```bash
+OCTOS_MCP_SERVER_TOKEN=secret \
+python src/main.py <requirement-dir> --octos-mcp http://127.0.0.1:4033/mcp
+```
+
+Env fallbacks: `OCTOS_MCP_URL`, `OCTOS_MCP_SERVER_TOKEN`, `OCTOS_MCP_CONTRACT`
+(default `coding`), `OCTOS_MCP_TIMEOUT` (default 1800s per stage).
+
+Mechanism: ARC calls octos's single `run_octos_session` MCP tool with
+`{contract, input:{prompt, expected_artifact, artifact_name}}`. The prompt
+carries the stage's system prompt + task and instructs octos to write its JSON
+result to `expected_artifact` (`.arc/delegated/<stage>-<node>.json`, relative to
+octos's `--cwd`). ARC reads the returned inline `artifact_content`, parses it
+into the stage output, and — for the TDD stage — still runs the node's tests
+itself before accepting `IMPLEMENTED`. octos's typed error prefixes
+(`contract_failed:`, `artifact_missing:`, `llm_error:`, …) surface as
+`StageDelegationError`.
+
+`--octos-mcp` and `--delegate-to` are mutually exclusive (both drive the same
+`set_stage_delegator` seam). The octos working dir MUST equal ARC's output dir
+so `expected_artifact` resolves to the shared workspace.
