@@ -224,7 +224,7 @@ class TestDrivenDeveloper:
             memory=[],
             tools=[run_tests, run_build, *traceability_tools],
         )
-        await self._log("Invoking deep-agent TDD implementation.", node_id=node_id)
+        await self._log("Invoking TDD implementation.", node_id=node_id)
         payload = await ainvoke_stage_agent(
             agent,
             message=message,
@@ -248,7 +248,7 @@ class TestDrivenDeveloper:
                 "Error: latest run_tests result did not pass with Exit Code: 0, "
                 "so IMPLEMENTED is not accepted for this batch."
             )
-        await self._log("TDD deep-agent session completed.", node_id=node_id)
+        await self._log("TDD session completed.", node_id=node_id)
         return final_text
 
     def get_last_run_tests_result(self) -> str | None:

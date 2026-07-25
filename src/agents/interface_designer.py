@@ -101,7 +101,7 @@ class InterfaceDesigner:
                 memory=[],
                 tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
             )
-            await self._log("Invoking deep-agent interface design.", node_id=node_id)
+            await self._log("Invoking interface design.", node_id=node_id)
             payload = await ainvoke_stage_agent(
                 agent,
                 message=message,
