@@ -15,7 +15,7 @@ All of them are configured with the same base env vars:
 Forward compilation milestones and errors as `arc_progress` structured messages:
 
 ```bash
-python src/main.py <requirement-dir> \
+python src/main.py compile <requirement-dir> -o <output-dir> \
   --agent-chat-url http://127.0.0.1:8090 \
   --agent-chat-group arc        # or --agent-chat-to <agent|human>
 ```
@@ -26,7 +26,7 @@ itself after 5 consecutive errors.
 ## 2. Serve mode (ARC as a dispatchable agent)
 
 ```bash
-python src/main.py --serve --agent-chat-url http://127.0.0.1:8090
+python src/main.py serve --agent-chat-url http://127.0.0.1:8090
 ```
 
 ARC heartbeats (auto-registering and showing online), polls its inbox, and
@@ -54,7 +54,7 @@ TestDrivenDeveloper) to an agent-chat CLI agent running on your subscription,
 instead of calling an OpenAI-compatible API:
 
 ```bash
-python src/main.py <requirement-dir> \
+python src/main.py compile <requirement-dir> -o <output-dir> \
   --agent-chat-url http://127.0.0.1:8090 \
   --delegate-to claude-implementer      # or ARC_DELEGATE_TO env
 ```
@@ -74,7 +74,7 @@ Guarantees:
   never advance ARC's inbox cursor.
 - Knobs: `ARC_DELEGATE_TIMEOUT` (default 1800s per stage),
   `ARC_DELEGATE_POLL_INTERVAL` (default 3s).
-- Works combined with `--serve` (tasks run sequentially, so delegation polls
+- Works combined with `serve` (tasks run sequentially, so delegation polls
   never race the worker's inbox reads).
 
 Limitations: screenshot visual analysis still uses `VISUAL_API_KEY` when the
@@ -98,7 +98,8 @@ Then run ARC pointing at it:
 
 ```bash
 OCTOS_MCP_SERVER_TOKEN=secret \
-python src/main.py <requirement-dir> --octos-mcp http://127.0.0.1:4033/mcp
+python src/main.py compile <requirement-dir> -o <output-dir> \
+  --octos-mcp http://127.0.0.1:4033/mcp
 ```
 
 Env fallbacks: `OCTOS_MCP_URL`, `OCTOS_MCP_SERVER_TOKEN`, `OCTOS_MCP_CONTRACT`

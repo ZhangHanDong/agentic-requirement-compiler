@@ -4,14 +4,23 @@ import argparse
 import asyncio
 import os
 import shutil
+import sys
 import time
-import tempfile
 from dataclasses import dataclass
+from typing import Any
 
 from app_type_handler import list_app_types, normalize_app_type
-from core.utils import cli_log, init_debug_logger, print_cli_banner, print_cli_startup, set_web_port, stop_cli_spinner
+from core.utils import (
+    cli_log,
+    init_debug_logger,
+    print_cli_banner,
+    print_cli_startup,
+    print_compilation_summary,
+    set_web_port,
+    stop_cli_spinner,
+)
 from core.workflow import ARCWorkflowManager
-from integrations.agent_chat import build_reporter
+from integrations.agent_chat import AgentChatReporter, build_reporter
 from integrations.octos_mcp import build_octos_delegator
 from integrations.stage_delegation import build_stage_delegator, set_stage_delegator
 
@@ -39,292 +48,186 @@ def _build_default_output_dir() -> str:
     return os.path.join(_get_repo_root(), "workspace", f"run-{timestamp}")
 
 
-def _resolve_requirement_dir(path: str) -> str:
-    normalized = os.path.abspath(path)
-    if not os.path.isdir(normalized):
-        raise FileNotFoundError(f"Requirement directory does not exist: {normalized}")
-    requirement_file = os.path.join(normalized, "requirements.yaml")
-    if not os.path.isfile(requirement_file):
-        raise FileNotFoundError(f"Requirement directory must contain requirements.yaml: {normalized}")
-    return normalized
+def _ensure_dotenv_loaded() -> None:
+    """Load .env file if present, respecting ARC_ENV_FILE override."""
+    from dotenv import load_dotenv
+
+    custom_env = os.environ.get("ARC_ENV_FILE", "").strip()
+    if custom_env and os.path.isfile(custom_env):
+        load_dotenv(custom_env, override=False)
+        return
+
+    default_env = os.path.join(_get_repo_root(), ".env")
+    if os.path.isfile(default_env):
+        load_dotenv(default_env, override=False)
 
 
-def _reset_directory(path: str) -> None:
-    if os.path.isdir(path):
-        shutil.rmtree(path, ignore_errors=True)
-    os.makedirs(path, exist_ok=True)
+def _locate_requirement_file(input_path: str) -> tuple[str, str, str]:
+    """Return the requirement directory, file path, and file name."""
+    abs_input = os.path.abspath(input_path)
+
+    if os.path.isfile(abs_input):
+        if not abs_input.endswith((".yaml", ".yml")):
+            raise ValueError(f"Input file must be .yaml or .yml: {abs_input}")
+        return os.path.dirname(abs_input), abs_input, os.path.basename(abs_input)
+
+    if os.path.isdir(abs_input):
+        for candidate in ("requirements.yaml", "requirements.yml"):
+            candidate_path = os.path.join(abs_input, candidate)
+            if os.path.isfile(candidate_path):
+                return abs_input, candidate_path, candidate
+        raise FileNotFoundError(f"No requirements.yaml found in {abs_input}")
+
+    raise FileNotFoundError(f"Input path not found: {abs_input}")
 
 
-def _copy_requirement_dir_contents(requirement_dir: str, output_dir: str) -> None:
-    target_requirements_dir = os.path.join(output_dir, "requirements")
-    os.makedirs(target_requirements_dir, exist_ok=True)
-    for entry in os.listdir(requirement_dir):
-        src = os.path.join(requirement_dir, entry)
-        dst = os.path.join(target_requirements_dir, entry)
-        if os.path.isdir(src):
-            shutil.copytree(src, dst, dirs_exist_ok=True)
-        else:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
-
-
-def _is_relative_to(path: str, parent: str) -> bool:
-    try:
-        os.path.commonpath([os.path.abspath(path), os.path.abspath(parent)]) == os.path.abspath(parent)
-    except ValueError:
-        return False
-    return os.path.commonpath([os.path.abspath(path), os.path.abspath(parent)]) == os.path.abspath(parent)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run ARC agent workflow from the command line.")
-    parser.add_argument(
-        "requirement_path",
-        nargs="?",
-        help="Requirement directory containing requirements.yaml and optional reference/ assets. Its contents will be copied into output-dir/requirements/ before compilation. Not needed with --serve.",
-    )
-    parser.add_argument(
-        "--serve",
-        action="store_true",
-        help="Run as a resident agent-chat worker: heartbeat, poll the inbox for task_request messages, compile each request, and reply with task_result. Requires --agent-chat-url / AGENT_CHAT_URL.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        help="Output workspace directory. Defaults to <repo_root>/workspace/run-<timestamp>.",
-    )
-    parser.add_argument(
-        "--clear-all",
-        action="store_true",
-        help="Reset the output directory before copying the requirement directory and recompiling.",
-    )
-    retry_group = parser.add_mutually_exclusive_group()
-    retry_group.add_argument(
-        "--retry-failed",
-        action="store_true",
-        help="Retry all failed nodes in the existing queue without clearing the workspace.",
-    )
-    retry_group.add_argument(
-        "--retry-node",
-        nargs="+",
-        metavar="NODE_ID",
-        help="Retry only the specified node ids in the existing queue.",
-    )
-    parser.add_argument(
-        "--app-type",
-        choices=list_app_types(),
-        default="web",
-        help="Application type for runtime stack context.",
-    )
-    parser.add_argument(
-        "--web-port",
-        type=int,
-        default=3000,
-        help="Single backend port for web apps. Ignored by non-web app types.",
-    )
+def _add_agent_backend_arguments(parser: argparse.ArgumentParser, *, progress: bool) -> None:
     parser.add_argument(
         "--agent-chat-url",
-        help="agent-chat backend base URL (e.g. http://127.0.0.1:8090) to report compilation progress to. Falls back to AGENT_CHAT_URL.",
+        help="agent-chat backend base URL. Falls back to AGENT_CHAT_URL.",
     )
-    parser.add_argument(
-        "--agent-chat-group",
-        help="agent-chat group to post progress into. Falls back to AGENT_CHAT_GROUP.",
-    )
-    parser.add_argument(
-        "--agent-chat-to",
-        help="agent-chat agent/human to DM progress to. Falls back to AGENT_CHAT_TO.",
-    )
+    if progress:
+        parser.add_argument(
+            "--agent-chat-group",
+            help="agent-chat group to post progress into. Falls back to AGENT_CHAT_GROUP.",
+        )
+        parser.add_argument(
+            "--agent-chat-to",
+            help="agent-chat agent/human to DM progress to. Falls back to AGENT_CHAT_TO.",
+        )
     parser.add_argument(
         "--delegate-to",
-        help="Delegate stage execution (design/tests/implementation) to this agent-chat agent (e.g. a Claude Code or Codex agent) instead of calling an OpenAI-compatible API. Requires --agent-chat-url / AGENT_CHAT_URL. Falls back to ARC_DELEGATE_TO.",
+        help="Delegate stage execution to this agent-chat agent. Falls back to ARC_DELEGATE_TO.",
     )
     parser.add_argument(
         "--octos-mcp",
-        help="Delegate stage execution to an octos MCP server (octos mcp-serve) at this URL (e.g. http://127.0.0.1:4033/mcp). octos brings its own model/key, so no OpenAI API key is needed. Falls back to OCTOS_MCP_URL. Mutually exclusive with --delegate-to.",
-    )
-    parser.add_argument(
-        "--model-api-mode",
-        choices=["responses", "chat_completions"],
-        help="OpenAI-compatible model API mode. Defaults to ARC_OPENAI_API_MODE or responses.",
-    )
-    return parser.parse_args()
-
-
-def prepare_config(args: argparse.Namespace) -> CompilationConfig:
-    return prepare_compilation(
-        requirement_path=args.requirement_path,
-        output_dir=args.output_dir,
-        clear_all=args.clear_all,
-        app_type=args.app_type,
-        web_port=args.web_port,
-        retry_failed=args.retry_failed,
-        retry_node_ids=args.retry_node,
-        model_api_mode=args.model_api_mode,
+        help="Delegate stage execution to an octos MCP server. Falls back to OCTOS_MCP_URL.",
     )
 
 
-def prepare_compilation(
-    requirement_path: str,
-    output_dir: str | None = None,
-    clear_all: bool = False,
-    app_type: str = "web",
-    web_port: int = 3000,
-    retry_failed: bool = False,
-    retry_node_ids: list[str] | None = None,
-    model_api_mode: str | None = None,
-) -> CompilationConfig:
-    normalized_output_dir = os.path.abspath(output_dir) if output_dir else _build_default_output_dir()
-    normalized_requirement_dir = _resolve_requirement_dir(requirement_path)
-    normalized_app_type = normalize_app_type(app_type)
-    normalized_retry_node_ids = [
-        str(node_id).strip() for node_id in (retry_node_ids or []) if str(node_id).strip()
-    ]
-
-    if clear_all and (retry_failed or normalized_retry_node_ids):
-        raise ValueError("--clear-all cannot be combined with retry options.")
-
-    web_port = int(web_port)
-    if normalized_app_type == "web" and (web_port < 1 or web_port > 65535):
-        raise ValueError(f"Web port must be between 1 and 65535, got: {web_port}")
-
-    if normalized_app_type == "web":
-        set_web_port(web_port)
-    normalized_model_api_mode = str(model_api_mode or "").strip() or None
-    if normalized_model_api_mode:
-        os.environ["ARC_OPENAI_API_MODE"] = normalized_model_api_mode
-    queue_path = os.path.join(normalized_output_dir, ".arc", "processing_queue.json")
-    resume_from_queue = (not clear_all) and os.path.exists(queue_path)
-    retry_requested = bool(retry_failed or normalized_retry_node_ids)
-    if retry_requested and not resume_from_queue:
-        raise FileNotFoundError(
-            f"Retry requires an existing queue in the output workspace: {queue_path}"
-        )
-
-    if not resume_from_queue:
-        staged_requirement_dir = normalized_requirement_dir
-        with tempfile.TemporaryDirectory(prefix="arc-agent-requirements-") as temp_dir:
-            if _is_relative_to(normalized_requirement_dir, normalized_output_dir):
-                staged_requirement_dir = os.path.join(temp_dir, "requirements")
-                shutil.copytree(normalized_requirement_dir, staged_requirement_dir, dirs_exist_ok=True)
-            _reset_directory(normalized_output_dir)
-            _copy_requirement_dir_contents(staged_requirement_dir, normalized_output_dir)
-
-    normalized_requirement_path = os.path.join(normalized_output_dir, "requirements", "requirements.yaml")
-    if not os.path.isfile(normalized_requirement_path):
-        raise FileNotFoundError(
-            f"Copied requirement workspace is missing requirements.yaml: {normalized_requirement_path}"
-        )
-
-    return CompilationConfig(
-        output_dir=normalized_output_dir,
-        requirement_dir=normalized_requirement_dir,
-        requirement_path=normalized_requirement_path,
-        user_requested_clear_all=clear_all,
-        app_type=normalized_app_type,
-        web_port=web_port,
-        resume_from_queue=resume_from_queue,
-        retry_failed=bool(retry_failed),
-        retry_node_ids=normalized_retry_node_ids or None,
-        model_api_mode=normalized_model_api_mode,
+def _resolve_progress_reporter(
+    args: argparse.Namespace,
+    *,
+    run_label: str,
+) -> AgentChatReporter | None:
+    group = getattr(args, "agent_chat_group", None) or os.environ.get("AGENT_CHAT_GROUP")
+    to = getattr(args, "agent_chat_to", None) or os.environ.get("AGENT_CHAT_TO")
+    if not group and not to:
+        return None
+    return build_reporter(
+        url=args.agent_chat_url,
+        group=group,
+        to=to,
+        run_label=run_label,
     )
 
 
 def resolve_stage_delegator(args: argparse.Namespace):
-    """Pick the configured stage-delegation backend (agent-chat or octos), if any."""
-    octos = build_octos_delegator(url=args.octos_mcp)
-    agentchat = build_stage_delegator(url=args.agent_chat_url, implementer=args.delegate_to)
-    if octos is not None and agentchat is not None:
+    """Pick the configured stage-delegation backend, if any."""
+    octos_requested = bool(args.octos_mcp or os.environ.get("OCTOS_MCP_URL"))
+    agent_requested = bool(
+        (args.delegate_to or os.environ.get("ARC_DELEGATE_TO"))
+        and (args.agent_chat_url or os.environ.get("AGENT_CHAT_URL"))
+    )
+    if octos_requested and agent_requested:
         raise SystemExit("--octos-mcp and --delegate-to are mutually exclusive; pick one backend")
-    return octos or agentchat
+    if octos_requested:
+        return build_octos_delegator(url=args.octos_mcp)
+    if agent_requested:
+        return build_stage_delegator(url=args.agent_chat_url, implementer=args.delegate_to)
+    return None
 
 
-async def run_serve(args: argparse.Namespace) -> None:
-    from integrations.agent_chat_worker import AgentChatWorker
-
-    url = args.agent_chat_url or os.environ.get("AGENT_CHAT_URL")
-    if not url:
-        raise SystemExit("--serve requires --agent-chat-url or AGENT_CHAT_URL")
-    try:
-        reporter = build_reporter(
-            url=args.agent_chat_url,
-            group=args.agent_chat_group,
-            to=args.agent_chat_to,
-            run_label="serve",
-        )
-    except ValueError:
-        reporter = None  # no progress target configured; task replies still work
-
-    async def run_task(payload: dict) -> dict:
-        config = prepare_compilation(
-            requirement_path=payload["requirement_dir"],
-            output_dir=payload.get("output_dir"),
-            clear_all=bool(payload.get("clear_all", False)),
-            app_type=payload.get("app_type", args.app_type),
-            web_port=int(payload.get("web_port", args.web_port)),
-            retry_failed=bool(payload.get("retry_failed", False)),
-            retry_node_ids=payload.get("retry_node_ids"),
-            model_api_mode=payload.get("model_api_mode", args.model_api_mode),
-        )
-        log_path = init_debug_logger(config.output_dir, reset_existing=not config.resume_from_queue)
-        log_cb = cli_log if reporter is None else reporter.make_log_cb(cli_log)
-        workflow_manager = ARCWorkflowManager(
-            workspace_path=config.output_dir,
-            requirement_path=config.requirement_path,
-            app_type=config.app_type,
-            web_port=config.web_port,
-            log_cb=log_cb,
-        )
-        raw = await workflow_manager.start_compilation(
-            clear_all=False,
-            resume_from_queue=config.resume_from_queue,
-            retry_failed=config.retry_failed,
-            retry_node_ids=config.retry_node_ids,
-        ) or {}
-        return {
-            "ok": bool(raw.get("ok")),
-            "failed_nodes": raw.get("failed_nodes") or [],
-            "output_dir": config.output_dir,
-            "log_path": log_path,
-        }
-
-    worker = AgentChatWorker(
-        url,
-        agent_name=os.environ.get("AGENT_CHAT_AGENT_NAME", "arc-compiler"),
-        task_runner=run_task,
-        api_token=os.environ.get("AGENT_CHAT_TOKEN"),
-        agent_token=os.environ.get("AGENT_CHAT_AGENT_TOKEN"),
+def build_compile_parser(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "compile",
+        help="Compile requirements into a working application",
+        description="Run ARC compilation from requirement tree to interfaces, tests, and implementation.",
     )
-    # Delegation is safe alongside the worker: tasks run sequentially inside
-    # run_forever, so the delegator's preview polls never race a cursor-advancing
-    # full inbox read.
+    parser.add_argument(
+        "requirement_path",
+        help="Path to requirements directory or .yaml file",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        required=True,
+        help="Output workspace directory",
+    )
+    parser.add_argument(
+        "-t",
+        "--type",
+        dest="app_type",
+        default="web",
+        help=f"Application type (choices: {', '.join(list_app_types())})",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=3301,
+        help="Web server port (only for app-type=web, default: 3301)",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove existing output directory before compilation",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from saved compilation queue",
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry all failed nodes from previous run (requires --resume)",
+    )
+    parser.add_argument(
+        "--retry",
+        nargs="+",
+        metavar="NODE_ID",
+        help="Retry specific node IDs (requires --resume)",
+    )
+    _add_agent_backend_arguments(parser, progress=True)
+    parser.set_defaults(func=cmd_compile)
+
+
+async def cmd_compile(args: argparse.Namespace) -> int:
+    """Execute the compile subcommand."""
+    _ensure_dotenv_loaded()
+
+    if args.clean and args.resume:
+        print("Error: --clean and --resume are mutually exclusive")
+        return 2
+    if (args.retry_failed or args.retry) and not args.resume:
+        print("Error: --retry-failed and --retry require --resume")
+        return 2
+    if args.retry_failed and args.retry:
+        print("Error: --retry-failed and --retry are mutually exclusive")
+        return 2
+
+    requirement_dir, requirement_path, _ = _locate_requirement_file(args.requirement_path)
+    output_dir = os.path.abspath(args.output_dir)
+    if args.clean and os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+
+    normalized_app_type = normalize_app_type(args.app_type)
+    set_web_port(args.port)
+    config = CompilationConfig(
+        output_dir=output_dir,
+        requirement_dir=requirement_dir,
+        requirement_path=requirement_path,
+        user_requested_clear_all=args.clean,
+        app_type=normalized_app_type,
+        web_port=args.port,
+        resume_from_queue=args.resume,
+        retry_failed=args.retry_failed,
+        retry_node_ids=args.retry or None,
+        model_api_mode=os.environ.get("ARC_OPENAI_API_MODE", "").strip() or None,
+    )
+
+    reporter = _resolve_progress_reporter(args, run_label=os.path.basename(config.output_dir))
     delegator = resolve_stage_delegator(args)
-    if delegator is not None:
-        set_stage_delegator(delegator)
-    print(f"ARC agent-chat worker online as '{worker.agent_name}' -> {url} (Ctrl-C to stop)", flush=True)
-    try:
-        await worker.run_forever()
-    finally:
-        if delegator is not None:
-            set_stage_delegator(None)
-            await delegator.aclose()
-        await worker.aclose()
-        if reporter is not None:
-            await reporter.aclose()
-
-
-async def run() -> None:
-    args = parse_args()
-    if args.serve:
-        await run_serve(args)
-        return
-    if not args.requirement_path:
-        raise SystemExit("requirement_path is required unless --serve is used")
-    config = prepare_config(args)
-    reporter = build_reporter(
-        url=args.agent_chat_url,
-        group=args.agent_chat_group,
-        to=args.agent_chat_to,
-        run_label=os.path.basename(config.output_dir),
-    )
     print_cli_banner()
     log_path = init_debug_logger(config.output_dir, reset_existing=not config.resume_from_queue)
     print_cli_startup(
@@ -339,13 +242,16 @@ async def run() -> None:
         retry_node_ids=config.retry_node_ids,
         model_api_mode=config.model_api_mode,
     )
+
     log_cb = cli_log
     if reporter is not None:
         await reporter.register()
         log_cb = reporter.make_log_cb(cli_log)
-    delegator = resolve_stage_delegator(args)
     if delegator is not None:
         set_stage_delegator(delegator)
+
+    result: dict[str, Any] = {"ok": False, "failed_nodes": []}
+    start_time = time.time()
     try:
         workflow_manager = ARCWorkflowManager(
             workspace_path=config.output_dir,
@@ -354,7 +260,7 @@ async def run() -> None:
             web_port=config.web_port,
             log_cb=log_cb,
         )
-        await workflow_manager.start_compilation(
+        result = await workflow_manager.start_compilation(
             clear_all=False,
             resume_from_queue=config.resume_from_queue,
             retry_failed=config.retry_failed,
@@ -368,9 +274,192 @@ async def run() -> None:
         if reporter is not None:
             await reporter.aclose()
 
+    print_compilation_summary(result, config.output_dir, time.time() - start_time)
+    return 0 if result.get("ok") else 1
+
+
+def build_serve_parser(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "serve",
+        help="Run ARC as a resident agent-chat worker",
+    )
+    parser.add_argument(
+        "-t",
+        "--type",
+        dest="app_type",
+        default="web",
+        help=f"Default application type (choices: {', '.join(list_app_types())})",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=3301,
+        help="Default web server port",
+    )
+    _add_agent_backend_arguments(parser, progress=True)
+    parser.set_defaults(func=cmd_serve)
+
+
+def _prepare_worker_config(payload: dict[str, Any], args: argparse.Namespace) -> CompilationConfig:
+    requirement_dir, requirement_path, _ = _locate_requirement_file(payload["requirement_dir"])
+    output_dir = os.path.abspath(payload.get("output_dir") or _build_default_output_dir())
+    clear_all = bool(payload.get("clear_all", False))
+    if clear_all and os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+
+    retry_node_ids = [
+        str(node_id).strip()
+        for node_id in (payload.get("retry_node_ids") or payload.get("retry") or [])
+        if str(node_id).strip()
+    ]
+    retry_failed = bool(payload.get("retry_failed", False))
+    queue_path = os.path.join(output_dir, ".arc", "processing_queue.json")
+    resume = bool(payload["resume"]) if "resume" in payload else (not clear_all and os.path.exists(queue_path))
+    if (retry_failed or retry_node_ids) and not resume:
+        raise ValueError("Worker retry options require an existing queue or resume=true")
+
+    model_api_mode = str(payload.get("model_api_mode") or "").strip() or None
+    if model_api_mode:
+        os.environ["ARC_OPENAI_API_MODE"] = model_api_mode
+
+    app_type = normalize_app_type(payload.get("app_type", args.app_type))
+    web_port = int(payload.get("web_port", payload.get("port", args.port)))
+    set_web_port(web_port)
+    return CompilationConfig(
+        output_dir=output_dir,
+        requirement_dir=requirement_dir,
+        requirement_path=requirement_path,
+        user_requested_clear_all=clear_all,
+        app_type=app_type,
+        web_port=web_port,
+        resume_from_queue=resume,
+        retry_failed=retry_failed,
+        retry_node_ids=retry_node_ids or None,
+        model_api_mode=model_api_mode or os.environ.get("ARC_OPENAI_API_MODE", "").strip() or None,
+    )
+
+
+async def cmd_serve(args: argparse.Namespace) -> int:
+    """Run as a dispatchable agent-chat worker."""
+    from integrations.agent_chat_worker import AgentChatWorker
+
+    _ensure_dotenv_loaded()
+    url = args.agent_chat_url or os.environ.get("AGENT_CHAT_URL")
+    if not url:
+        raise SystemExit("serve requires --agent-chat-url or AGENT_CHAT_URL")
+
+    reporter = _resolve_progress_reporter(args, run_label="serve")
+    delegator = resolve_stage_delegator(args)
+
+    async def run_task(payload: dict[str, Any]) -> dict[str, Any]:
+        config = _prepare_worker_config(payload, args)
+        log_path = init_debug_logger(config.output_dir, reset_existing=not config.resume_from_queue)
+        log_cb = cli_log if reporter is None else reporter.make_log_cb(cli_log)
+        workflow_manager = ARCWorkflowManager(
+            workspace_path=config.output_dir,
+            requirement_path=config.requirement_path,
+            app_type=config.app_type,
+            web_port=config.web_port,
+            log_cb=log_cb,
+        )
+        raw = await workflow_manager.start_compilation(
+            clear_all=False,
+            resume_from_queue=config.resume_from_queue,
+            retry_failed=config.retry_failed,
+            retry_node_ids=config.retry_node_ids,
+        )
+        return {
+            "ok": bool(raw.get("ok")),
+            "failed_nodes": raw.get("failed_nodes") or [],
+            "output_dir": config.output_dir,
+            "log_path": log_path,
+        }
+
+    worker = AgentChatWorker(
+        url,
+        agent_name=os.environ.get("AGENT_CHAT_AGENT_NAME", "arc-compiler"),
+        task_runner=run_task,
+        api_token=os.environ.get("AGENT_CHAT_TOKEN"),
+        agent_token=os.environ.get("AGENT_CHAT_AGENT_TOKEN"),
+    )
+    if delegator is not None:
+        set_stage_delegator(delegator)
+    print(f"ARC agent-chat worker online as '{worker.agent_name}' -> {url} (Ctrl-C to stop)", flush=True)
+    try:
+        await worker.run_forever()
+    finally:
+        if delegator is not None:
+            set_stage_delegator(None)
+            await delegator.aclose()
+        await worker.aclose()
+        if reporter is not None:
+            await reporter.aclose()
+    return 0
+
+
+def build_doctor_parser(subparsers: Any) -> None:
+    build_config_parser(subparsers)
+    parser = subparsers.add_parser(
+        "doctor",
+        help="Check ARC configuration and environment",
+        description="Validate configuration, check dependencies, and diagnose common issues.",
+    )
+    parser.set_defaults(func=cmd_doctor)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Execute the doctor subcommand."""
+    _ensure_dotenv_loaded()
+    from config_validator import print_health_check
+
+    return print_health_check()
+
+
+def build_config_parser(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "config",
+        help="Configure ARC interactively",
+        description="Create or update .env file with core configuration.",
+    )
+    parser.set_defaults(func=cmd_config)
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Execute the config subcommand."""
+    from config_validator import interactive_config_setup
+
+    return interactive_config_setup()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="arc",
+        description="ARC: Agentic Requirement Compiler",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="ARC 1.1.0",
+    )
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        help="Available commands",
+    )
+    build_compile_parser(subparsers)
+    build_serve_parser(subparsers)
+    build_doctor_parser(subparsers)
+    return parser
+
 
 def main() -> None:
-    asyncio.run(run())
+    parser = build_parser()
+    args = parser.parse_args()
+    if asyncio.iscoroutinefunction(args.func):
+        exit_code = asyncio.run(args.func(args))
+    else:
+        exit_code = args.func(args)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
