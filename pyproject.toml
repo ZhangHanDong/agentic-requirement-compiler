@@ -27,10 +27,15 @@ arc = "main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+py-modules = [
+  "config_validator",
+  "main",
+]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = true
 include = [
   "agents",
   "agents.*",
@@ -42,12 +47,21 @@ include = [
   "context.*",
   "core",
   "core.*",
+  "integrations",
+  "integrations.*",
+  "skills",
+  "templates",
   "tools",
   "tools.*",
 ]
 
 [tool.setuptools.package-data]
+skills = ["**/*"]
 templates = ["**/*", "**/.*"]
+
+[tool.setuptools.exclude-package-data]
+skills = ["**/__pycache__/*", "**/*.pyc"]
+templates = ["**/__pycache__/*", "**/*.pyc"]
 
 [project.optional-dependencies]
 test = [
