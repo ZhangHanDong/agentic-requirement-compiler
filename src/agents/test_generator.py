@@ -8,12 +8,9 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
-from agents.context import AgentRuntimeContext
-from agents.factory import build_stage_agent
-from agents.runners import ainvoke_stage_agent
+from agents.backend import AgentBackend, BuiltinAgentBackend, CompiledAgentTask
 from context.context_pipeline import context_pipeline
 from context.prompts.test_generator import get_system_prompt, get_user_prompt
-from integrations.stage_delegation import get_stage_delegator
 from tools.result_parsers import normalize_test_manifest_payload
 from tools.traceability_tools import build_traceability_tools
 
@@ -37,7 +34,7 @@ class TestGenerationResponse(BaseModel):
 
 
 class TestGenerator:
-    """Deep-agents based test-generation stage adapter."""
+    """Compile test-generation work and submit it to the configured backend."""
 
     agent_name = "TestGenerator"
 
@@ -49,12 +46,14 @@ class TestGenerator:
         workspace_root: str | None = None,
         requirement_path: str | None = None,
         app_type: str | None = None,
+        agent_backend: AgentBackend | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", "openai:gpt-5.4")
         self.workspace_root = workspace_root
         self.requirement_path = requirement_path or ""
         self.app_type = app_type
+        self.agent_backend = agent_backend or BuiltinAgentBackend()
 
     async def run(
         self,
@@ -89,45 +88,47 @@ class TestGenerator:
             dynamic_context=context_text,
             interface_contract=interface_contract,
         )
-        delegator = get_stage_delegator()
-        if delegator is not None:
-            await self._log("Delegating test generation to agent-chat implementer.", node_id=node_id)
-            raw_payload = await delegator.invoke_stage(
+        response_schema = TestGenerationResponse.model_json_schema()
+        await self._log(
+            f"Submitting test generation to {self.agent_backend.name} agent backend.",
+            node_id=node_id,
+        )
+        raw_payload = await self.agent_backend.execute(
+            CompiledAgentTask(
+                task_id=f"{node_id}:DESIGN:{self.agent_name}",
                 stage=self.agent_name,
+                backend_agent_name="test_generator",
                 node_id=node_id,
                 phase="DESIGN",
+                app_type=app_type,
                 workspace_root=workspace_root,
+                requirement_path=self.requirement_path,
                 system_prompt=get_system_prompt(),
                 message=message,
-                response_schema=TestGenerationResponse.model_json_schema(),
-            )
-        else:
-            agent = build_stage_agent(
-                name="test_generator",
+                response_schema=response_schema,
+                inputs={
+                    "requirement": requirement_data,
+                    "compiled_context": context_text,
+                    "interface_contract": interface_contract,
+                },
+                acceptance={
+                    "response_schema_required": True,
+                    "artifact_kind": "test_manifest",
+                },
                 model=self.model,
-                system_prompt=get_system_prompt(),
                 response_format=TestGenerationResponse,
-                workspace_root=workspace_root,
-                writable_roots=[workspace_root],
-                skills=[f"/skills/{name}/" for name in skill_names if (skill_root / name / "SKILL.md").exists()],
-                memory=[],
-                tools=build_traceability_tools(node_id=node_id, log_cb=self.log_cb),
-            )
-            await self._log("Invoking test generation.", node_id=node_id)
-            raw_payload = await ainvoke_stage_agent(
-                agent,
-                message=message,
-                context=AgentRuntimeContext(
-                    node_id=node_id,
-                    phase="DESIGN",
-                    app_type=app_type,
-                    workspace_root=workspace_root,
-                    requirement_path=self.requirement_path,
+                skills=tuple(
+                    f"/skills/{name}/"
+                    for name in skill_names
+                    if (skill_root / name / "SKILL.md").exists()
                 ),
-                thread_id=f"{node_id}:DESIGN:TestGenerator",
-                label=self.agent_name,
+                runtime_tools=tuple(
+                    build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
+                ),
                 log_cb=self.log_cb,
+                thread_id=f"{node_id}:DESIGN:{self.agent_name}",
             )
+        )
         tests = normalize_test_manifest_payload(raw_payload)
         output_text = json.dumps(raw_payload or {"tests": tests}, ensure_ascii=False)
         await self._log(f"Test generation returned {len(tests)} test artifact(s).", node_id=node_id)

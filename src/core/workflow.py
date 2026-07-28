@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from agents.backend import AgentBackend, BuiltinAgentBackend
 from agents.interface_designer import InterfaceDesigner
 from agents.test_driven_developer import TestDrivenDeveloper
 from agents.test_generator import TestGenerator
@@ -60,6 +61,7 @@ class ARCWorkflowManager:
         app_type: str = "web",
         web_port: int = 3301,
         log_cb: LogCallback | None = None,
+        agent_backend: AgentBackend | None = None,
     ) -> None:
         self.workspace_path = str(Path(workspace_path).expanduser().resolve())
         self.requirement_path = str(Path(requirement_path).expanduser().resolve()) if requirement_path else ""
@@ -67,6 +69,7 @@ class ARCWorkflowManager:
         self.web_port = int(web_port)
         set_workspace_root(self.workspace_path)
         self.log_cb = log_cb or _default_log_cb
+        self.agent_backend = agent_backend or BuiltinAgentBackend()
 
         self.arc_dir = os.path.join(self.workspace_path, ".arc")
         self.queue_path = os.path.join(self.arc_dir, QUEUE_FILENAME)
@@ -78,18 +81,21 @@ class ARCWorkflowManager:
             workspace_root=self.workspace_path,
             requirement_path=self.requirement_path,
             app_type=self.app_type,
+            agent_backend=self.agent_backend,
         )
         self.test_generator = TestGenerator(
             self.log_cb,
             workspace_root=self.workspace_path,
             requirement_path=self.requirement_path,
             app_type=self.app_type,
+            agent_backend=self.agent_backend,
         )
         self.test_driven_developer = TestDrivenDeveloper(
             self.log_cb,
             workspace_root=self.workspace_path,
             requirement_path=self.requirement_path,
             app_type=self.app_type,
+            agent_backend=self.agent_backend,
         )
         self.phase_runner = WorkflowPhaseRunner(
             workspace_path=self.workspace_path,

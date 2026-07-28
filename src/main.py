@@ -9,6 +9,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from agents.backend import (
+    BuiltinAgentBackend,
+    DelegatingAgentBackend,
+    LocalOctosBackend,
+)
 from app_type_handler import list_app_types, normalize_app_type
 from core.utils import (
     cli_log,
@@ -21,8 +26,13 @@ from core.utils import (
 )
 from core.workflow import ARCWorkflowManager
 from integrations.agent_chat import AgentChatReporter, build_reporter
-from integrations.octos_mcp import build_octos_delegator
-from integrations.stage_delegation import build_stage_delegator, set_stage_delegator
+from integrations.octos_mcp import (
+    LocalOctosMcpDelegator,
+    OctosMcpDelegator,
+    build_local_octos_delegator,
+    build_octos_delegator,
+)
+from integrations.stage_delegation import build_stage_delegator
 
 
 @dataclass(slots=True)
@@ -81,7 +91,12 @@ def _locate_requirement_file(input_path: str) -> tuple[str, str, str]:
     raise FileNotFoundError(f"Input path not found: {abs_input}")
 
 
-def _add_agent_backend_arguments(parser: argparse.ArgumentParser, *, progress: bool) -> None:
+def _add_agent_backend_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    progress: bool,
+    local_octos: bool = False,
+) -> None:
     parser.add_argument(
         "--agent-chat-url",
         help="agent-chat backend base URL. Falls back to AGENT_CHAT_URL.",
@@ -103,6 +118,24 @@ def _add_agent_backend_arguments(parser: argparse.ArgumentParser, *, progress: b
         "--octos-mcp",
         help="Delegate stage execution to an octos MCP server. Falls back to OCTOS_MCP_URL.",
     )
+    if local_octos:
+        parser.add_argument(
+            "--agent-backend",
+            choices=("builtin", "octos-local"),
+            help=(
+                "Agent execution backend. Falls back to ARC_AGENT_BACKEND. "
+                "Legacy Octos/delegation flags remain supported."
+            ),
+        )
+        parser.add_argument(
+            "--octos-local",
+            action="store_true",
+            help="Run a local octos MCP subprocess over stdio. Falls back to ARC_OCTOS_LOCAL.",
+        )
+        parser.add_argument(
+            "--octos-bin",
+            help="Path to the local octos executable. Implies --octos-local; falls back to OCTOS_BIN.",
+        )
 
 
 def _resolve_progress_reporter(
@@ -122,20 +155,80 @@ def _resolve_progress_reporter(
     )
 
 
-def resolve_stage_delegator(args: argparse.Namespace):
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_stage_delegator(
+    args: argparse.Namespace,
+    *,
+    workspace_root: str | None = None,
+):
     """Pick the configured stage-delegation backend, if any."""
+    selected_backend = (
+        getattr(args, "agent_backend", None)
+        or os.environ.get("ARC_AGENT_BACKEND", "")
+    ).strip().lower()
+    if selected_backend and selected_backend not in {"builtin", "octos-local"}:
+        raise SystemExit(
+            "ARC_AGENT_BACKEND must be one of: builtin, octos-local"
+        )
+    local_requested = bool(
+        getattr(args, "octos_local", False)
+        or getattr(args, "octos_bin", None)
+        or _env_truthy("ARC_OCTOS_LOCAL")
+    )
     octos_requested = bool(args.octos_mcp or os.environ.get("OCTOS_MCP_URL"))
     agent_requested = bool(
         (args.delegate_to or os.environ.get("ARC_DELEGATE_TO"))
         and (args.agent_chat_url or os.environ.get("AGENT_CHAT_URL"))
     )
-    if octos_requested and agent_requested:
-        raise SystemExit("--octos-mcp and --delegate-to are mutually exclusive; pick one backend")
+    if selected_backend == "builtin":
+        if local_requested or octos_requested or agent_requested:
+            raise SystemExit(
+                "--agent-backend builtin conflicts with Octos or agent-chat "
+                "delegation configuration"
+            )
+        return None
+    if selected_backend == "octos-local":
+        local_requested = True
+    if sum((local_requested, octos_requested, agent_requested)) > 1:
+        raise SystemExit(
+            "--octos-local, --octos-mcp, and --delegate-to are mutually exclusive; "
+            "pick one backend"
+        )
+    if local_requested:
+        if not workspace_root:
+            raise SystemExit("--octos-local requires an ARC output workspace")
+        try:
+            return build_local_octos_delegator(
+                getattr(args, "octos_bin", None),
+                workspace_root=workspace_root,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     if octos_requested:
         return build_octos_delegator(url=args.octos_mcp)
     if agent_requested:
         return build_stage_delegator(url=args.agent_chat_url, implementer=args.delegate_to)
     return None
+
+
+def resolve_agent_backend(
+    args: argparse.Namespace,
+    *,
+    workspace_root: str | None = None,
+):
+    """Resolve the unified backend consumed by all compiled agent tasks."""
+
+    delegator = resolve_stage_delegator(args, workspace_root=workspace_root)
+    if delegator is None:
+        return BuiltinAgentBackend()
+    if isinstance(delegator, LocalOctosMcpDelegator):
+        return LocalOctosBackend(delegator)
+    if isinstance(delegator, OctosMcpDelegator):
+        return DelegatingAgentBackend(delegator, name="octos-http")
+    return DelegatingAgentBackend(delegator, name="agent-chat")
 
 
 def build_compile_parser(subparsers: Any) -> None:
@@ -188,7 +281,7 @@ def build_compile_parser(subparsers: Any) -> None:
         metavar="NODE_ID",
         help="Retry specific node IDs (requires --resume)",
     )
-    _add_agent_backend_arguments(parser, progress=True)
+    _add_agent_backend_arguments(parser, progress=True, local_octos=True)
     parser.set_defaults(func=cmd_compile)
 
 
@@ -227,7 +320,7 @@ async def cmd_compile(args: argparse.Namespace) -> int:
     )
 
     reporter = _resolve_progress_reporter(args, run_label=os.path.basename(config.output_dir))
-    delegator = resolve_stage_delegator(args)
+    agent_backend = resolve_agent_backend(args, workspace_root=config.output_dir)
     print_cli_banner()
     log_path = init_debug_logger(config.output_dir, reset_existing=not config.resume_from_queue)
     print_cli_startup(
@@ -243,22 +336,20 @@ async def cmd_compile(args: argparse.Namespace) -> int:
         model_api_mode=config.model_api_mode,
     )
 
-    log_cb = cli_log
-    if reporter is not None:
-        await reporter.register()
-        log_cb = reporter.make_log_cb(cli_log)
-    if delegator is not None:
-        set_stage_delegator(delegator)
-
     result: dict[str, Any] = {"ok": False, "failed_nodes": []}
     start_time = time.time()
     try:
+        log_cb = cli_log
+        if reporter is not None:
+            await reporter.register()
+            log_cb = reporter.make_log_cb(cli_log)
         workflow_manager = ARCWorkflowManager(
             workspace_path=config.output_dir,
             requirement_path=config.requirement_path,
             app_type=config.app_type,
             web_port=config.web_port,
             log_cb=log_cb,
+            agent_backend=agent_backend,
         )
         result = await workflow_manager.start_compilation(
             clear_all=False,
@@ -268,9 +359,7 @@ async def cmd_compile(args: argparse.Namespace) -> int:
         )
     finally:
         stop_cli_spinner()
-        if delegator is not None:
-            set_stage_delegator(None)
-            await delegator.aclose()
+        await agent_backend.aclose()
         if reporter is not None:
             await reporter.aclose()
 
@@ -349,7 +438,7 @@ async def cmd_serve(args: argparse.Namespace) -> int:
         raise SystemExit("serve requires --agent-chat-url or AGENT_CHAT_URL")
 
     reporter = _resolve_progress_reporter(args, run_label="serve")
-    delegator = resolve_stage_delegator(args)
+    agent_backend = resolve_agent_backend(args)
 
     async def run_task(payload: dict[str, Any]) -> dict[str, Any]:
         config = _prepare_worker_config(payload, args)
@@ -361,6 +450,7 @@ async def cmd_serve(args: argparse.Namespace) -> int:
             app_type=config.app_type,
             web_port=config.web_port,
             log_cb=log_cb,
+            agent_backend=agent_backend,
         )
         raw = await workflow_manager.start_compilation(
             clear_all=False,
@@ -382,15 +472,11 @@ async def cmd_serve(args: argparse.Namespace) -> int:
         api_token=os.environ.get("AGENT_CHAT_TOKEN"),
         agent_token=os.environ.get("AGENT_CHAT_AGENT_TOKEN"),
     )
-    if delegator is not None:
-        set_stage_delegator(delegator)
     print(f"ARC agent-chat worker online as '{worker.agent_name}' -> {url} (Ctrl-C to stop)", flush=True)
     try:
         await worker.run_forever()
     finally:
-        if delegator is not None:
-            set_stage_delegator(None)
-            await delegator.aclose()
+        await agent_backend.aclose()
         await worker.aclose()
         if reporter is not None:
             await reporter.aclose()

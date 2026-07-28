@@ -57,7 +57,8 @@ Use the following setup as a practical baseline. The installation example below 
 
 - [Python 3.11+](https://www.python.org/downloads/)
 - A virtual environment and package manager such as [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
-- An OpenAI-compatible API endpoint and model
+- Either an OpenAI-compatible endpoint and model for the built-in backend, or
+  a configured local [Octos](https://github.com/octos-org/octos) installation
 
 Additional requirements for web generation:
 - [Node.js 20+](https://nodejs.org/en/download) with [`pnpm`](https://pnpm.io/installation)
@@ -126,6 +127,12 @@ VISUAL_MODEL=
 ARC_DEBUG=0
 ```
 
+The values above configure ARC's built-in backend. To run the three agent
+stages through local Octos instead, configure `ARC_AGENT_BACKEND=octos-local`
+and `OCTOS_BIN`; see [Using Octos for requirement compilation](OCTOS.md).
+Requirements containing screenshots may still need the separate `VISUAL_*`
+configuration.
+
 **Validate configuration:**
 ```bash
 arc doctor
@@ -184,6 +191,10 @@ arc compile example/ticketbooking-demo -o workspace/demo \
 
 Run `arc --help` or `arc compile --help` for detailed usage.
 
+To let ARC keep compilation orchestration and test verification while running
+the model-based stages through a local Octos agent, see
+[Using Octos for requirement compilation](OCTOS.md).
+
 #### Main Arguments
 
 | Argument | Description |
@@ -196,6 +207,8 @@ Run `arc --help` or `arc compile --help` for detailed usage.
 | `--resume` | Resume from saved compilation queue |
 | `--retry-failed` | Retry all failed nodes (requires `--resume`) |
 | `--retry NODE_ID...` | Retry specific node IDs (requires `--resume`) |
+| `--agent-backend` | Agent execution backend: `builtin` or `octos-local` |
+| `--octos-bin` | Local Octos executable path; also selects `octos-local` |
 
 #### Runtime behavior
 

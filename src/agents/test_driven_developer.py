@@ -6,12 +6,9 @@ import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from agents.context import AgentRuntimeContext
-from agents.factory import build_stage_agent
-from agents.runners import ainvoke_stage_agent
+from agents.backend import AgentBackend, BuiltinAgentBackend, CompiledAgentTask
 from context.context_pipeline import context_pipeline
 from context.prompts.test_driven_developer import get_system_prompt, get_user_prompt
-from integrations.stage_delegation import get_stage_delegator
 from tools.runtime_tools import build_run_build_tool as build_system_run_build_tool
 from tools.traceability_tools import build_traceability_tools
 
@@ -20,7 +17,7 @@ LogCallback = Callable[[str, str, str | None, str | None], Awaitable[None] | Non
 
 
 class TestDrivenDeveloper:
-    """Deep-agents based TDD implementation adapter."""
+    """Compile TDD work, execute it through a backend, and verify the result."""
 
     agent_name = "TestDrivenDeveloper"
 
@@ -33,6 +30,7 @@ class TestDrivenDeveloper:
         requirement_path: str | None = None,
         app_type: str | None = None,
         app_handler: Any | None = None,
+        agent_backend: AgentBackend | None = None,
     ) -> None:
         self.log_cb = log_cb
         self.model = model or os.environ.get("MODEL", "openai:gpt-5.4")
@@ -40,6 +38,7 @@ class TestDrivenDeveloper:
         self.requirement_path = requirement_path or ""
         self.app_type = app_type
         self.app_handler = app_handler
+        self.agent_backend = agent_backend or BuiltinAgentBackend()
         self._last_run_tests_result: str | None = None
         self._last_run_tests_exit_code: int | None = None
         self._last_verifier_report_text = ""
@@ -187,18 +186,54 @@ class TestDrivenDeveloper:
             node_tests=current_node_tests,
             previous_failure_summary=previous_failure_summary,
         )
-        delegator = get_stage_delegator()
-        if delegator is not None:
-            await self._log("Delegating TDD implementation to agent-chat implementer.", node_id=node_id)
-            reply = await delegator.invoke_stage(
+        traceability_tools = build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
+        await self._log(
+            f"Submitting TDD implementation to {self.agent_backend.name} agent backend.",
+            node_id=node_id,
+        )
+        reply = await self.agent_backend.execute(
+            CompiledAgentTask(
+                task_id=f"{node_id}:IMPLEMENT:{self.agent_name}:{test_type or 'batch'}",
                 stage=self.agent_name,
+                backend_agent_name="test_driven_developer",
                 node_id=node_id,
                 phase="IMPLEMENT",
+                app_type=app_type,
                 workspace_root=workspace_root,
+                requirement_path=self.requirement_path,
                 system_prompt=get_system_prompt(),
                 message=message,
                 response_schema=None,
+                inputs={
+                    "compiled_context": context_text,
+                    "interface_contract": interface_contract,
+                    "test_type": test_type,
+                    "test_files": list(self._current_test_files),
+                    "node_tests": current_node_tests,
+                    "previous_failure_summary": previous_failure_summary,
+                },
+                acceptance={
+                    "system_test_verification": True,
+                    "required_exit_code": 0,
+                    "registered_test_files": list(self._current_test_files),
+                },
+                model=self.model,
+                response_format=None,
+                skills=tuple(
+                    f"/skills/{name}/"
+                    for name in skill_names
+                    if (skill_root / name / "SKILL.md").exists()
+                ),
+                runtime_tools=(run_tests, run_build, *traceability_tools),
+                log_cb=self.log_cb,
+                test_type=test_type,
+                thread_id=(
+                    f"{node_id}:IMPLEMENT:{self.agent_name}:"
+                    f"{self._current_test_type or 'batch'}"
+                ),
             )
+        )
+        if getattr(self.agent_backend, "is_external", False):
             # Verification stays system-owned: the implementer's claim is only
             # accepted if ARC's own test run passes.
             verification = await run_tests(None, self._current_test_files or None)
@@ -207,40 +242,11 @@ class TestDrivenDeveloper:
             if self._last_run_tests_exit_code == 0:
                 return f"IMPLEMENTED: {summary}"
             return (
-                "Delegated implementation did not pass system-run tests.\n"
-                f"Implementer summary: {summary}\n"
+                "External backend result was rejected by system-run tests.\n"
                 f"{verification}"
             )
 
-        traceability_tools = build_traceability_tools(node_id=node_id, log_cb=self.log_cb)
-        agent = build_stage_agent(
-            name="test_driven_developer",
-            model=self.model,
-            system_prompt=get_system_prompt(),
-            response_format=None,
-            workspace_root=workspace_root,
-            writable_roots=[workspace_root],
-            skills=[f"/skills/{name}/" for name in skill_names if (skill_root / name / "SKILL.md").exists()],
-            memory=[],
-            tools=[run_tests, run_build, *traceability_tools],
-        )
-        await self._log("Invoking TDD implementation.", node_id=node_id)
-        payload = await ainvoke_stage_agent(
-            agent,
-            message=message,
-            context=AgentRuntimeContext(
-                node_id=node_id,
-                phase="IMPLEMENT",
-                app_type=app_type,
-                workspace_root=workspace_root,
-                requirement_path=self.requirement_path,
-                test_type=self._current_test_type,
-            ),
-            thread_id=f"{node_id}:IMPLEMENT:TestDrivenDeveloper:{self._current_test_type or 'batch'}",
-            label=self.agent_name,
-            log_cb=self.log_cb,
-        )
-        final_text = self._payload_to_final_text(payload)
+        final_text = self._payload_to_final_text(reply)
         if self._test_budget_exhausted and stop_on_test_budget_exhausted:
             return "BUDGET_EXHAUSTED"
         if "IMPLEMENTED" in final_text.upper() and self._last_run_tests_exit_code != 0:

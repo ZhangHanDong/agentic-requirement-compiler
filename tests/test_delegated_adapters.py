@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from integrations.stage_delegation import set_stage_delegator
+from agents.backend import DelegatingAgentBackend
 
 
 class FakeDelegator:
@@ -13,12 +13,6 @@ class FakeDelegator:
     async def invoke_stage(self, **kwargs):
         self.calls.append(kwargs)
         return self.output
-
-
-@pytest.fixture(autouse=True)
-def clean_delegator():
-    yield
-    set_stage_delegator(None)
 
 
 @pytest.fixture
@@ -34,17 +28,9 @@ def quiet_context(monkeypatch, tmp_path):
     return tmp_path
 
 
-def forbid_local_agent(monkeypatch, module):
-    def _fail(*args, **kwargs):
-        raise AssertionError("build_stage_agent must not be called in delegated mode")
-
-    monkeypatch.setattr(module, "build_stage_agent", _fail)
-
-
-async def test_interface_designer_uses_delegator(monkeypatch, quiet_context):
+async def test_interface_designer_uses_delegator(quiet_context):
     import agents.interface_designer as mod
 
-    forbid_local_agent(monkeypatch, mod)
     fake = FakeDelegator(
         {
             "summary": "designed",
@@ -52,9 +38,12 @@ async def test_interface_designer_uses_delegator(monkeypatch, quiet_context):
             "files_written": ["backend/src/x.ts"],
         }
     )
-    set_stage_delegator(fake)
+    backend = DelegatingAgentBackend(fake, name="test-delegator")
 
-    designer = mod.InterfaceDesigner(workspace_root=str(quiet_context))
+    designer = mod.InterfaceDesigner(
+        workspace_root=str(quiet_context),
+        agent_backend=backend,
+    )
     bundle = await designer.run(node_id="n1", requirement_data={"children_ids": []})
 
     assert bundle["summary"] == "designed"
@@ -69,10 +58,9 @@ async def test_interface_designer_uses_delegator(monkeypatch, quiet_context):
     assert call["message"].strip()
 
 
-async def test_test_generator_uses_delegator(monkeypatch, quiet_context):
+async def test_test_generator_uses_delegator(quiet_context):
     import agents.test_generator as mod
 
-    forbid_local_agent(monkeypatch, mod)
     fake = FakeDelegator(
         {
             "summary": "tests planned",
@@ -87,9 +75,12 @@ async def test_test_generator_uses_delegator(monkeypatch, quiet_context):
             "files_written": ["backend/tests/x.spec.ts"],
         }
     )
-    set_stage_delegator(fake)
+    backend = DelegatingAgentBackend(fake, name="test-delegator")
 
-    generator = mod.TestGenerator(workspace_root=str(quiet_context))
+    generator = mod.TestGenerator(
+        workspace_root=str(quiet_context),
+        agent_backend=backend,
+    )
     tests, output_text = await generator.run("n2", {"children_ids": []})
 
     assert isinstance(tests, list) and len(tests) == 1
@@ -98,19 +89,21 @@ async def test_test_generator_uses_delegator(monkeypatch, quiet_context):
     assert fake.calls[0]["stage"] == "TestGenerator"
 
 
-async def test_tdd_delegated_passes_when_system_tests_pass(monkeypatch, quiet_context):
+async def test_tdd_delegated_passes_when_system_tests_pass(quiet_context):
     import agents.test_driven_developer as mod
 
-    forbid_local_agent(monkeypatch, mod)
     fake = FakeDelegator({"summary": "implemented the feature"})
-    set_stage_delegator(fake)
+    backend = DelegatingAgentBackend(fake, name="test-delegator")
     executor_calls = []
 
     async def run_tests_executor(test_type, test_files):
         executor_calls.append((test_type, test_files))
         return "Exit Code: 0\nAll tests passed."
 
-    developer = mod.TestDrivenDeveloper(workspace_root=str(quiet_context))
+    developer = mod.TestDrivenDeveloper(
+        workspace_root=str(quiet_context),
+        agent_backend=backend,
+    )
     result = await developer.run(
         node_id="n3",
         test_files=["backend/tests/x.spec.ts"],
@@ -124,17 +117,19 @@ async def test_tdd_delegated_passes_when_system_tests_pass(monkeypatch, quiet_co
     assert fake.calls[0]["phase"] == "IMPLEMENT"
 
 
-async def test_tdd_delegated_fails_when_system_tests_fail(monkeypatch, quiet_context):
+async def test_tdd_delegated_fails_when_system_tests_fail(quiet_context):
     import agents.test_driven_developer as mod
 
-    forbid_local_agent(monkeypatch, mod)
     fake = FakeDelegator({"summary": "claims done"})
-    set_stage_delegator(fake)
+    backend = DelegatingAgentBackend(fake, name="test-delegator")
 
     async def run_tests_executor(test_type, test_files):
         return "Exit Code: 1\nSTDERR:\nexpected 200, got 500"
 
-    developer = mod.TestDrivenDeveloper(workspace_root=str(quiet_context))
+    developer = mod.TestDrivenDeveloper(
+        workspace_root=str(quiet_context),
+        agent_backend=backend,
+    )
     result = await developer.run(
         node_id="n4",
         test_files=["backend/tests/x.spec.ts"],
@@ -152,7 +147,6 @@ async def test_end_to_end_interface_designer_through_real_delegator(
     import agents.interface_designer as mod
     from integrations.stage_delegation import StageDelegator
 
-    forbid_local_agent(monkeypatch, mod)
     chat_server.post_responses["/api/messages"] = {"ok": True, "id": "msg_e2e_1"}
     chat_server.get_responses["/api/inbox/arc-compiler"] = {
         "dm": [
@@ -184,13 +178,15 @@ async def test_end_to_end_interface_designer_through_real_delegator(
         poll_interval=0.01,
         timeout=5.0,
     )
-    set_stage_delegator(delegator)
+    backend = DelegatingAgentBackend(delegator, name="agent-chat")
     try:
-        designer = mod.InterfaceDesigner(workspace_root=str(quiet_context))
+        designer = mod.InterfaceDesigner(
+            workspace_root=str(quiet_context),
+            agent_backend=backend,
+        )
         bundle = await designer.run(node_id="n-e2e", requirement_data={"children_ids": []})
     finally:
-        set_stage_delegator(None)
-        await delegator.aclose()
+        await backend.aclose()
 
     assert bundle["summary"] == "e2e designed"
     assert bundle["interfaces"] == [{"name": "GET /api/tickets"}]

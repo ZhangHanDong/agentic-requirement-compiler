@@ -81,40 +81,58 @@ Limitations: screenshot visual analysis still uses `VISUAL_API_KEY` when the
 requirement references screenshots; the implementer agent must run on the same
 machine (shared filesystem) and have permission to edit the workspace.
 
-## 4. Stage delegation to octos (direct MCP, no agent-chat)
+## 4. Stage delegation to local octos (stdio MCP, no agent-chat)
 
-Delegate the stage agents to [octos](https://github.com/.../octos) via its MCP
-server instead of going through agent-chat. octos runs its own agentic coding
-loop with its own model + key, so ARC needs no OpenAI-compatible key.
+Delegate the stage agents to [Octos](https://github.com/octos-org/octos) via its MCP
+server instead of going through agent-chat. Octos runs its own agentic coding
+loop with its own model + key, so ARC needs no OpenAI-compatible key for those
+three stages. Screenshot analysis remains separately configured as noted below.
 
-Launch octos as an MCP server whose working directory is ARC's output dir:
-
-```bash
-OCTOS_MCP_SERVER_TOKEN=secret \
-  octos mcp-serve --transport http --bind 127.0.0.1:4033 --cwd <ARC-output-dir>
-```
-
-Then run ARC pointing at it:
+For a local compile, ARC launches and owns one octos stdio subprocess, reuses
+it for every delegated stage, and closes it when compilation ends:
 
 ```bash
-OCTOS_MCP_SERVER_TOKEN=secret \
 python src/main.py compile <requirement-dir> -o <output-dir> \
-  --octos-mcp http://127.0.0.1:4033/mcp
+  --agent-backend octos-local \
+  --octos-bin /path/to/octos
 ```
 
-Env fallbacks: `OCTOS_MCP_URL`, `OCTOS_MCP_SERVER_TOKEN`, `OCTOS_MCP_CONTRACT`
-(default `coding`), `OCTOS_MCP_TIMEOUT` (default 1800s per stage).
+`--octos-local` remains a compatibility alias. `--octos-bin` defaults to
+`OCTOS_BIN`, then to `octos` on `PATH`; specifying the flag also selects the
+local backend. `ARC_AGENT_BACKEND=octos-local` is the preferred environment
+configuration, while `ARC_OCTOS_LOCAL=1` remains supported. ARC starts the
+equivalent of:
 
-Mechanism: ARC calls octos's single `run_octos_session` MCP tool with
+```bash
+octos mcp-serve --transport stdio --cwd <output-dir>
+```
+
+No MCP port or bearer token is needed. Octos still needs its own local provider
+configuration. Runtime knobs: `OCTOS_MCP_CONTRACT` (default `coding`),
+`OCTOS_MCP_TIMEOUT` (default 1800s per stage), and
+`OCTOS_MCP_STARTUP_TIMEOUT` (default 30s for initialize/tool discovery).
+
+Mechanism: each adapter compiles an `arc.agent-task.v1` package and saves it
+under `.arc/agent_tasks/`. `LocalOctosBackend` sends that same contract through
+Octos's single `run_octos_session` MCP tool with
 `{contract, input:{prompt, expected_artifact, artifact_name}}`. The prompt
-carries the stage's system prompt + task and instructs octos to write its JSON
-result to `expected_artifact` (`.arc/delegated/<stage>-<node>.json`, relative to
-octos's `--cwd`). ARC reads the returned inline `artifact_content`, parses it
+carries the compiled task, including its system prompt, task input, output
+schema and acceptance conditions, and instructs octos to write its JSON result
+to `expected_artifact` (`.arc/delegated/<stage>-<node>.json`, relative to
+Octos's `--cwd`). ARC reads the returned inline `artifact_content`, parses it
 into the stage output, and — for the TDD stage — still runs the node's tests
-itself before accepting `IMPLEMENTED`. octos's typed error prefixes
+itself before accepting `IMPLEMENTED`. Octos's typed error prefixes
 (`contract_failed:`, `artifact_missing:`, `llm_error:`, …) surface as
 `StageDelegationError`.
 
-`--octos-mcp` and `--delegate-to` are mutually exclusive (both drive the same
-`set_stage_delegator` seam). The octos working dir MUST equal ARC's output dir
-so `expected_artifact` resolves to the shared workspace.
+`--agent-backend builtin`, local Octos, remote Octos, and agent-chat delegation
+are mutually exclusive execution choices. The workflow injects one backend
+instance into all three stage adapters; the legacy `set_stage_delegator` API is
+retained only for compatibility. Local subprocess mode is currently available
+on `compile`; the resident `serve` worker does not yet manage a per-workspace
+local Octos process pool.
+
+The existing `--octos-mcp` option remains for compatible remote JSON-RPC HTTP
+endpoints. Current Octos releases expose MCP Streamable HTTP with session/SSE
+semantics, so use `--agent-backend octos-local` for direct interoperability
+until ARC's remote transport is upgraded.
